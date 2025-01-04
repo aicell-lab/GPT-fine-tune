@@ -1,0 +1,225 @@
+import cv2
+import numpy as np
+import torch
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+import os
+import json
+import glob
+import logging
+
+# Configure logging
+logging.basicConfig(
+    filename='Microsam&vector_create/process.log',  # Log file path
+    filemode='a',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+def get_bounding_box(mask):
+    """
+    Calculate bounding box coordinates from a binary mask.
+
+    Args:
+        mask (np.ndarray): Binary mask of shape (H, W)
+
+    Returns:
+        tuple: (xmin, ymin, xmax, ymax) or None if mask is empty
+    """
+    ys, xs = np.where(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+    xmin, xmax = xs.min(), xs.max()
+    ymin, ymax = ys.min(), ys.max()
+    return (int(xmin), int(ymin), int(xmax), int(ymax))
+
+def get_mask_embedding_using_patch_embeddings(mask, enc_emb, return_all=False):
+    """
+    Compute the embedding vector for a single mask using patch embeddings.
+
+    Args:
+        mask (np.ndarray): Binary mask of shape (1024, 1024)
+        enc_emb (np.ndarray): Encoder embeddings of shape (64, 64, 256)
+        return_all (bool): Whether to return all intermediate data
+
+    Returns:
+        np.ndarray: 1x256 embedding vector
+        tuple: patch_locations and patch_embeddings if return_all is True
+    """
+    # Converting mask of shape 1024x1024 to shape: 64x64x16x16 
+    split_mask = np.array(np.split(mask, 64, axis=-1))
+    split_mask = np.array(np.split(split_mask, 64, axis=-2))
+    split_mask = split_mask * 1  # split_mask is a mask of shape: 64x64x16x16 
+    
+    # Converting split_mask of shape: 64x64x16x16 to 64x64 by summing over the 16x16 grids
+    split_mask = np.sum(split_mask, axis=-1)
+    split_mask = np.sum(split_mask, axis=-1)
+    
+    # Get all patch embeddings from this split_mask of 64x64
+    patch_locations = np.where(split_mask > 1)
+    patch_embeddings = enc_emb[patch_locations]
+    mask_embedding = patch_embeddings.mean(axis=0)
+    
+    if return_all:
+        return mask_embedding, patch_locations, patch_embeddings
+    return mask_embedding
+
+def process_image(img_path, mask_generator, predictor, mask_crop_dir):
+    """
+    Process a single image: generate masks, extract embeddings, save cropped mask images, and collect metadata.
+
+    Args:
+        img_path (str): Path to the image file.
+        mask_generator (SamAutomaticMaskGenerator): Initialized mask generator.
+        predictor (SamPredictor): Initialized SAM predictor.
+        mask_crop_dir (str): Directory to save cropped mask images.
+
+    Returns:
+        list: List of dictionaries containing embedding and metadata for each mask.
+    """
+    try:
+        # Read and preprocess the image
+        img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            logging.error(f"Failed to read image: {img_path}")
+            return []
+        img = cv2.resize(img, (1024, 1024))
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Generate masks
+        masks = mask_generator.generate(img_rgb)
+        logging.info(f"Image {os.path.basename(img_path)} generated {len(masks)} masks.")
+        
+        if len(masks) == 0:
+            logging.warning(f"No masks detected in image {os.path.basename(img_path)}.")
+            return []
+        
+        # Set image for predictor and get encoder embeddings
+        predictor.set_image(img_rgb)
+        enc_emb = predictor.features
+        enc_emb = enc_emb.to("cpu").numpy()[0].transpose((1, 2, 0))  # Shape: 64x64x256
+        
+        # Initialize a list to store embeddings and metadata for this image
+        image_embeddings = []
+        
+        image_id = os.path.basename(img_path).split('.')[0]
+        
+        for idx, mask in enumerate(masks):
+            # Calculate bounding box
+            bbox = get_bounding_box(mask['segmentation'])
+            if bbox is None:
+                logging.warning(f"Mask {idx} in image {image_id} has no valid bounding box.")
+                continue
+            
+            # Extract embedding
+            mask_emb = get_mask_embedding_using_patch_embeddings(mask['segmentation'], enc_emb)
+            
+            # Get mask coordinates
+            coords = np.argwhere(mask['segmentation'] == True)
+            coords_list = coords.tolist()  # Convert to Python list for JSON serialization
+            
+            # Generate a unique mask_id using image name and index
+            mask_id = f"{image_id}_mask_{idx}"
+            
+            # Crop the image to the bounding box
+            xmin, ymin, xmax, ymax = bbox
+            cropped_img = img_rgb[ymin:ymax+1, xmin:xmax+1]
+            cropped_mask = mask['segmentation'][ymin:ymax+1, xmin:xmax+1]
+            
+            # Ensure the mask is binary
+            cropped_mask_binary = (cropped_mask > 0).astype(np.uint8)
+            
+            # Create an alpha channel based on the mask
+            alpha = cropped_mask_binary * 255  # 255 for mask, 0 for background
+            
+            # Combine the cropped image with the alpha channel
+            cropped_img_rgba = cv2.cvtColor(cropped_img, cv2.COLOR_RGB2RGBA)
+            cropped_img_rgba[:, :, 3] = alpha  # Set alpha channel
+            
+            # Define mask image path
+            mask_image_filename = f"{mask_id}.png"
+            mask_image_path = os.path.join(mask_crop_dir, mask_image_filename)
+            
+            # Save the cropped mask image with transparency
+            cv2.imwrite(mask_image_path, cv2.cvtColor(cropped_img_rgba, cv2.COLOR_RGBA2BGRA))
+            
+            # Record embedding and metadata
+            embedding_data = {
+                "image_id": image_id,
+                "mask_id": mask_id,
+                "bounding_box": bbox,
+                "area": mask['area'],
+                "embedding": mask_emb.tolist(),
+                "coordinates": coords_list,  # Store mask coordinates
+                "mask_image": mask_image_path  # Path to the saved cropped mask image
+            }
+            image_embeddings.append(embedding_data)
+        
+        logging.info(f"All masks for image {image_id} have been processed.")
+        return image_embeddings
+    
+    except Exception as e:
+        logging.error(f"Error processing image {img_path}: {e}")
+        return []
+
+def main():
+    sam_checkpoint = "Microsam&vector_create/segment-anything/sam_vit_h_4b8939.pth"  # Path to SAM weights
+    image_dir = "Microsam&vector_create/inputs"  
+    output_json_dir = "Microsam&vector_create/outputs/20images_jsons_file" 
+    mask_crop_dir = "Microsam&vector_create/outputs/mask_crops"  # Directory to save cropped mask images
+    
+    # Create output directories if they don't exist
+    os.makedirs(output_json_dir, exist_ok=True)
+    os.makedirs(mask_crop_dir, exist_ok=True)
+    
+    # Check device availability
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logging.info(f"Using device: {device}")
+    print(f"Using device: {device}")
+    
+    # Load SAM model
+    model_type = "vit_h"
+    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+    sam.to(device=device)
+    
+    # Initialize SamPredictor
+    predictor = SamPredictor(sam)
+    
+    # Initialize Mask Generator
+    mask_generator = SamAutomaticMaskGenerator(
+        model=sam,
+        points_per_side=40,
+        pred_iou_thresh=0.90,
+        stability_score_thresh=0.90,
+        crop_n_layers=1,
+        crop_n_points_downscale_factor=2,
+        min_mask_region_area=50,
+    )
+    
+    # List all PNG images in the image directory and its subdirectories
+    image_paths = glob.glob(os.path.join(image_dir, '**', '*.png'), recursive=True)
+    logging.info(f"Found {len(image_paths)} PNG images to process.")
+    print(f"Found {len(image_paths)} PNG images to process.")
+    
+    for img_path in image_paths:
+        # Process each image and get embeddings and metadata
+        image_embeddings = process_image(img_path, mask_generator, predictor, mask_crop_dir)
+        
+        if not image_embeddings:
+            continue  # Skip saving if no embeddings
+        
+        # Define JSON file path
+        image_id = os.path.basename(img_path).split('.')[0]
+        json_path = os.path.join(output_json_dir, f"{image_id}_embeddings.json")
+        
+        # Save embeddings and metadata to JSON
+        with open(json_path, 'w') as f:
+            json.dump(image_embeddings, f, indent=4)
+        
+        logging.info(f"Embeddings and metadata for image {image_id} have been saved to {json_path}")
+        print(f"Embeddings and metadata for image {image_id} have been saved to {json_path}")
+    
+    logging.info("All images have been processed.")
+    print("All images have been processed.")
+
+if __name__ == "__main__":
+    main()
